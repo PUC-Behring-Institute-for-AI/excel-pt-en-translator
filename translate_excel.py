@@ -256,13 +256,20 @@ def main():
 
     client = genai.Client(api_key=api_key)
 
+    # Inject date + model into the output filename
+    # e.g. "report.xlsx" → "report_2026-05-31_gemini-2.5-flash.xlsx"
+    base, ext = os.path.splitext(args.output)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    model_slug = args.model.replace("/", "-")
+    output_path = f"{base}_{date_str}_{model_slug}{ext}"
+
     print(f"Loading: {args.input}")
     wb = openpyxl.load_workbook(args.input)
 
     translate_workbook(wb, client, args.model, args.batch_size)
 
-    print(f"Saving: {args.output}")
-    wb.save(args.output)
+    print(f"Saving: {output_path}")
+    wb.save(output_path)
     print("Done!")
 
 
