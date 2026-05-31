@@ -288,6 +288,14 @@ def translate_workbook(wb: openpyxl.Workbook, translate_fn, model_name: str, bat
         if not isinstance(cell, MergedCell):
             cell.value = _sanitize(new_value)
 
+    # Translate sheet tab names
+    print("  Translating sheet names…", end=" ", flush=True)
+    old_names = wb.sheetnames
+    translated_names = translate_fn(old_names)
+    for old, new in zip(old_names, translated_names):
+        wb[old].title = _sanitize(new)
+    print("done")
+
     print(f"\n{'─' * 60}")
     print(f"  Finished     : {datetime.now().strftime('%H:%M:%S')}")
     print(f"{'─' * 60}\n")
