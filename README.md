@@ -1,22 +1,22 @@
 # Excel PT → EN Translator
 
-Translates an Excel (`.xlsx`) file from **Portuguese to English** using the **Google Gemini API**.
+Translates an Excel (`.xlsx`) file from **Portuguese to English** using the **OpenCode Zen API** — a curated gateway that gives access to 30+ models (Claude, GPT, Gemini, Qwen…) with a single API key.
 
 - Preserves proper nouns, institution names, course codes, URLs, and English technical terms
 - Handles multiple sheets automatically
 - Retries automatically on rate-limit errors with the delay suggested by the API
 - Real-time progress bar with elapsed time and ETA
+- Output filename automatically includes the date and model used
 
 ---
 
-## Getting a Gemini API Key
+## Getting an OpenCode Zen API Key
 
-1. Go to **[aistudio.google.com](https://aistudio.google.com)**
-2. Sign in with your Google account
-3. Click **"Get API key"** → **"Create API key"**
-4. Copy the key — it starts with `AIza…`
+1. Go to **[opencode.ai](https://opencode.ai)**
+2. Sign in and go to your account settings
+3. Click **"Create API key"** and copy it
 
-> The free tier of `gemini-2.5-flash` is enough to translate a spreadsheet with a few thousand cells.
+> OpenCode Zen is pay-as-you-go. Translation of a ~2000-cell spreadsheet costs a few cents depending on the model used.
 
 ---
 
@@ -32,38 +32,32 @@ pip install -r requirements.txt
 
 ```bash
 # Pass the key directly
-python translate_excel.py input.xlsx output.xlsx --api-key AIzaSy...
+python translate_excel.py input.xlsx output.xlsx --api-key YOUR_KEY
 
 # Or export it as an environment variable (recommended)
-export GEMINI_API_KEY=AIzaSy...
+export OPENCODE_ZEN_API_KEY=YOUR_KEY
 python translate_excel.py input.xlsx output.xlsx
+```
+
+The output filename automatically includes the date and model:
+
+```
+output_2026-05-31_opencode-claude-sonnet-4-5.xlsx
 ```
 
 ### Options
 
 | Option | Default | Description |
 |---|---|---|
-| `--api-key` | `GEMINI_API_KEY` env var | Your Gemini API key |
-| `--model` | `gemini-2.5-flash` | Gemini model to use |
+| `--api-key` | `OPENCODE_ZEN_API_KEY` env var | Your OpenCode Zen API key |
+| `--model` | `opencode/claude-sonnet-4-5` | Model to use (OpenCode Zen format) |
 | `--batch-size` | `20` | Number of cells sent per API call |
+| `--list-models` | — | Print all available models and exit |
 
-### Testing available models
+### Listing available models
 
-If you hit quota errors, run this to see which models your key supports:
-
-```python
-from google import genai, types
-import time
-
-client = genai.Client(api_key="YOUR_KEY")
-for m in client.models.list():
-    if "generateContent" in (m.supported_actions or []):
-        try:
-            r = client.models.generate_content(model=m.name, contents="Say hi")
-            print(f"OK   {m.name}")
-        except Exception as e:
-            print(f"FAIL {m.name}  →  {str(e)[:60]}")
-        time.sleep(2)
+```bash
+python translate_excel.py dummy.xlsx dummy_out.xlsx --api-key YOUR_KEY --list-models
 ```
 
 ---
@@ -94,19 +88,17 @@ The spreadsheet this script was originally built for (`Levantamento Dados Inicia
 | Iniciativas administrativas | Administrative AI initiatives (name, unit, usage, tools) |
 | Documentos administrativos | Administrative documents (name, function) |
 
-The script handles any similar tabular structure without modification.
-
 ---
 
 ## How it works
 
 1. **Loads** the workbook with `openpyxl`
 2. **Collects** all translatable string cells across every sheet
-3. **Batches** them into groups of `--batch-size` and sends each batch to Gemini in a single API call using a structured JSON prompt
+3. **Batches** them into groups of `--batch-size` and sends each batch to OpenCode Zen in a single API call using a structured JSON prompt
 4. **Parses** the JSON array response and writes translations back into the workbook
-5. **Saves** the translated workbook to the output path
+5. **Saves** the translated workbook with `_<date>_<model>` appended to the filename
 
-The prompt instructs Gemini to preserve:
+The prompt instructs the model to preserve:
 - Person names and place names
 - Institution names: `PUC-Rio`, `ICA`, `CCEC`, `ECOA`, `BI MASTER`, `AcademIA`, etc.
 - Course codes: `BIA1001`, `MEC2007`, `CIS2114`, etc.

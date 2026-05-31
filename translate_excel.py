@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Translate Excel file from Portuguese to English using Google Gemini API.
+Translate Excel file from Portuguese to English using OpenCode Zen API.
+
+OpenCode Zen is an OpenAI-compatible gateway (https://opencode.ai/zen/v1)
+that gives access to 30+ curated models (Claude, GPT, Gemini, Qwen…)
+with a single API key and pay-as-you-go billing.
 
 Usage:
     python translate_excel.py input.xlsx output.xlsx --api-key YOUR_KEY
-    python translate_excel.py input.xlsx output.xlsx  # reads GEMINI_API_KEY env var
+    python translate_excel.py input.xlsx output.xlsx  # reads OPENCODE_ZEN_API_KEY env var
 """
 
 import argparse
@@ -13,16 +17,18 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 
 try:
-    from google import genai
+    from openai import OpenAI
 except ImportError:
-    print("ERROR: google-genai not installed. Run: pip install google-genai")
+    print("ERROR: openai not installed. Run: pip install openai")
     sys.exit(1)
+
+OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen/v1"
 
 
 # ─── Progress logger ────────────────────────────────────────────────────────
@@ -34,17 +40,16 @@ class Progress:
         self.cells_done = 0
         self.batches_done = 0
         self.start_time = time.time()
-        self.current_sheet = ""
 
     def _elapsed(self) -> str:
         s = int(time.time() - self.start_time)
         return f"{s // 60:02d}:{s % 60:02d}"
 
-    def _eta(self, batch_size: int) -> str:
+    def _eta(self) -> str:
         elapsed = time.time() - self.start_time
         if self.cells_done == 0:
             return "--:--"
-        rate = self.cells_done / elapsed          # cells/sec
+        rate = self.cells_done / elapsed
         remaining = self.total_cells - self.cells_done
         eta_s = int(remaining / rate) if rate > 0 else 0
         return f"{eta_s // 60:02d}:{eta_s % 60:02d}"
@@ -58,9 +63,8 @@ class Progress:
             f"\r[{bar}] {pct:5.1f}%  "
             f"batch {batch_num}/{self.total_batches}  "
             f"cells {self.cells_done}/{self.total_cells}  "
-            f"elapsed {self._elapsed()}  "
-            f"ETA {self._eta(batch_size)}  "
-            f"sheet: {sheet[:30]}",
+            f"elapsed {self._elapsed()}  ETA {self._eta()}  "
+            f"sheet: {sheet[:28]}",
             end="  ",
             flush=True,
         )
@@ -75,8 +79,8 @@ class Progress:
             f"\r[{'█' * 25}] 100.0%  "
             f"batch {self.total_batches}/{self.total_batches}  "
             f"cells {self.total_cells}/{self.total_cells}  "
-            f"elapsed {elapsed // 60:02d}:{elapsed % 60:02d}  "
-            f"ETA 00:00" + " " * 40
+            f"elapsed {elapsed // 60:02d}:{elapsed % 60:02d}  ETA 00:00"
+            + " " * 40
         )
 
 
@@ -96,7 +100,7 @@ def should_translate(cell) -> bool:
     return True
 
 
-def translate_batch(client, model_name: str, texts: list) -> list:
+def translate_batch(client: OpenAI, model_name: str, texts: list) -> list:
     texts_json = json.dumps(texts, ensure_ascii=False, indent=2)
 
     prompt = f"""You are a professional translator. Translate the following texts from Portuguese to English.
@@ -126,8 +130,11 @@ Output (JSON array, {len(texts)} strings):"""
     max_retries = 6
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(model=model_name, contents=prompt)
-            raw = response.text.strip()
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.choices[0].message.content.strip()
             if raw.startswith("```"):
                 lines = raw.splitlines()
                 raw = "\n".join(lines[1:-1]).strip()
@@ -140,8 +147,8 @@ Output (JSON array, {len(texts)} strings):"""
         except Exception as exc:
             err_str = str(exc)
 
-            # Rate limit — read suggested retry delay and wait
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            # Rate limit — honour the suggested retry delay
+            if "429" in err_str or "rate" in err_str.lower():
                 delay = 62.0
                 match = re.search(r"retry[^\d]*(\d+(?:\.\d+)?)\s*s", err_str, re.I)
                 if match:
@@ -154,12 +161,11 @@ Output (JSON array, {len(texts)} strings):"""
                     print(f"\n  WARNING: rate limit persisted after {max_retries} retries — keeping originals for this batch.")
                     return texts
 
-            # Fatal errors — abort immediately
-            if any(code in err_str for code in ("404", "403", "NOT_FOUND", "PERMISSION_DENIED")):
+            # Fatal errors (auth / model not found) — abort immediately
+            if any(code in err_str for code in ("401", "403", "404", "NOT_FOUND", "PERMISSION_DENIED", "Unauthorized")):
                 print(f"\n\nFATAL: {exc}\n")
                 sys.exit(1)
 
-            # Other unexpected error
             print(f"\n  WARNING: unexpected error ({exc}) — keeping originals for this batch.")
             return texts
 
@@ -168,9 +174,8 @@ Output (JSON array, {len(texts)} strings):"""
 
 # ─── Core workbook translation ───────────────────────────────────────────────
 
-def translate_workbook(wb: openpyxl.Workbook, client, model_name: str, batch_size: int) -> None:
-    # Collect all translatable cells grouped by sheet
-    pending = []  # (sheet_name, row, col, text)
+def translate_workbook(wb: openpyxl.Workbook, client: OpenAI, model_name: str, batch_size: int) -> None:
+    pending = []
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         for row in ws.iter_rows():
@@ -204,11 +209,10 @@ def translate_workbook(wb: openpyxl.Workbook, client, model_name: str, batch_siz
         progress.finish_batch(len(batch))
 
         if i + batch_size < total:
-            time.sleep(1.5)
+            time.sleep(1.0)
 
     progress.done()
 
-    # Write translations back
     for (sheet_name, row, col, _), new_value in zip(pending, translated):
         cell = wb[sheet_name].cell(row=row, column=col)
         if not isinstance(cell, MergedCell):
@@ -223,19 +227,20 @@ def translate_workbook(wb: openpyxl.Workbook, client, model_name: str, batch_siz
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Translate an Excel (.xlsx) file from Portuguese to English using Gemini."
+        description="Translate an Excel (.xlsx) file from Portuguese to English via OpenCode Zen."
     )
     parser.add_argument("input", help="Path to the source .xlsx file")
-    parser.add_argument("output", help="Path for the translated .xlsx file")
+    parser.add_argument("output", help="Path for the translated .xlsx file (date and model are appended automatically)")
     parser.add_argument(
         "--api-key",
         default=None,
-        help="Google Gemini API key (falls back to GEMINI_API_KEY env var)",
+        help="OpenCode Zen API key (falls back to OPENCODE_ZEN_API_KEY env var). Get one at https://opencode.ai",
     )
     parser.add_argument(
         "--model",
-        default="gemini-2.5-flash",
-        help="Gemini model name (default: gemini-2.5-flash)",
+        default="opencode/claude-sonnet-4-5",
+        help="Model name in OpenCode Zen format (default: opencode/claude-sonnet-4-5). "
+             "Run with --list-models to see all available options.",
     )
     parser.add_argument(
         "--batch-size",
@@ -243,21 +248,30 @@ def main():
         default=20,
         help="Number of texts per API call (default: 20)",
     )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List available models for your API key and exit",
+    )
     args = parser.parse_args()
 
-    api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
+    api_key = args.api_key or os.environ.get("OPENCODE_ZEN_API_KEY")
     if not api_key:
         print(
-            "ERROR: Gemini API key not found.\n"
-            "  Pass --api-key YOUR_KEY  or  set the GEMINI_API_KEY environment variable.\n"
-            "  Get a free key at: https://aistudio.google.com"
+            "ERROR: OpenCode Zen API key not found.\n"
+            "  Pass --api-key YOUR_KEY  or  set the OPENCODE_ZEN_API_KEY environment variable.\n"
+            "  Get a free key at: https://opencode.ai"
         )
         sys.exit(1)
 
-    client = genai.Client(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url=OPENCODE_ZEN_BASE_URL)
 
-    # Inject date + model into the output filename
-    # e.g. "report.xlsx" → "report_2026-05-31_gemini-2.5-flash.xlsx"
+    if args.list_models:
+        print("Available models in OpenCode Zen:\n")
+        for m in client.models.list():
+            print(f"  {m.id}")
+        return
+
     base, ext = os.path.splitext(args.output)
     date_str = datetime.now().strftime("%Y-%m-%d")
     model_slug = args.model.replace("/", "-")
