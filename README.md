@@ -1,22 +1,42 @@
 # Excel PT → EN Translator
 
-Translates an Excel (`.xlsx`) file from **Portuguese to English** using the **OpenCode Zen API** — a curated gateway that gives access to 30+ models (Claude, GPT, Gemini, Qwen…) with a single API key.
+Translates an Excel (`.xlsx`) file from **Portuguese to English** using your choice of AI provider.
 
 - Preserves proper nouns, institution names, course codes, URLs, and English technical terms
 - Handles multiple sheets automatically
-- Retries automatically on rate-limit errors with the delay suggested by the API
+- Retries automatically on rate-limit errors
 - Real-time progress bar with elapsed time and ETA
 - Output filename automatically includes the date and model used
 
 ---
 
-## Getting an OpenCode Zen API Key
+## Providers
 
+| Provider | Flag | Env var | Default model | Cost |
+|---|---|---|---|---|
+| **OpenCode Zen** (default) | `--provider opencode-zen` | `OPENCODE_ZEN_API_KEY` | `opencode/big-pickle` | **Free** |
+| **Google Gemini** | `--provider gemini` | `GEMINI_API_KEY` | `gemini-2.5-flash` | ~$0.02 per spreadsheet |
+
+---
+
+## Getting an API Key
+
+### OpenCode Zen (free)
 1. Go to **[opencode.ai](https://opencode.ai)**
-2. Sign in and go to your account settings
-3. Click **"Create API key"** and copy it
+2. Sign in → account settings → **"Create API key"**
 
-> OpenCode Zen is pay-as-you-go. Translation of a ~2000-cell spreadsheet costs a few cents depending on the model used.
+Free models available in OpenCode Zen:
+- `opencode/big-pickle` ← default (best free performance)
+- `opencode/minimax-m2.5-free`
+- `opencode/mimo-v2-pro-free`
+- `opencode/mimo-v2-omni-free`
+- `opencode/nemotron-3-super-free`
+
+### Google Gemini
+1. Go to **[aistudio.google.com](https://aistudio.google.com)**
+2. Sign in → **"Get API key"** → **"Create API key"**
+
+Tested working model: `gemini-2.5-flash`
 
 ---
 
@@ -31,42 +51,47 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Pass the key directly
-python translate_excel.py input.xlsx output.xlsx --api-key YOUR_KEY
-
-# Or export it as an environment variable (recommended)
+# OpenCode Zen (free, default)
 export OPENCODE_ZEN_API_KEY=YOUR_KEY
 python translate_excel.py input.xlsx output.xlsx
+
+# Google Gemini
+export GEMINI_API_KEY=YOUR_KEY
+python translate_excel.py input.xlsx output.xlsx --provider gemini
+
+# Pass key directly
+python translate_excel.py input.xlsx output.xlsx --api-key YOUR_KEY
+
+# Use a specific model
+python translate_excel.py input.xlsx output.xlsx --model opencode/mimo-v2-pro-free
+
+# List available models for a provider
+python translate_excel.py dummy.xlsx dummy.xlsx --list-models
+python translate_excel.py dummy.xlsx dummy.xlsx --provider gemini --list-models
 ```
 
 The output filename automatically includes the date and model:
-
 ```
-output_2026-05-31_opencode-claude-sonnet-4-5.xlsx
+output_2026-05-31_opencode-big-pickle.xlsx
 ```
 
-### Options
+### All options
 
 | Option | Default | Description |
 |---|---|---|
-| `--api-key` | `OPENCODE_ZEN_API_KEY` env var | Your OpenCode Zen API key |
-| `--model` | `opencode/claude-sonnet-4-5` | Model to use (OpenCode Zen format) |
-| `--batch-size` | `20` | Number of cells sent per API call |
-| `--list-models` | — | Print all available models and exit |
-
-### Listing available models
-
-```bash
-python translate_excel.py dummy.xlsx dummy_out.xlsx --api-key YOUR_KEY --list-models
-```
+| `--provider` | `opencode-zen` | `opencode-zen` or `gemini` |
+| `--api-key` | env var | API key for the selected provider |
+| `--model` | provider default | Override the default model |
+| `--batch-size` | `20` | Number of cells per API call |
+| `--list-models` | — | Print available models and exit |
 
 ---
 
 ## Expected spreadsheet structure
 
-The script translates **any** `.xlsx` file — it does not require a specific structure. It iterates over every sheet and every cell, translating all non-empty string values.
+The script translates **any** `.xlsx` file — no specific structure required. It iterates over every sheet and every cell, translating all non-empty string values.
 
-**Cells that are skipped (left unchanged):**
+**Cells skipped (left unchanged):**
 
 | Type | Example |
 |---|---|
@@ -94,7 +119,7 @@ The spreadsheet this script was originally built for (`Levantamento Dados Inicia
 
 1. **Loads** the workbook with `openpyxl`
 2. **Collects** all translatable string cells across every sheet
-3. **Batches** them into groups of `--batch-size` and sends each batch to OpenCode Zen in a single API call using a structured JSON prompt
+3. **Batches** them and sends each batch to the selected provider in one API call using a structured JSON prompt
 4. **Parses** the JSON array response and writes translations back into the workbook
 5. **Saves** the translated workbook with `_<date>_<model>` appended to the filename
 

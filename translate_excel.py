@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-Translate Excel file from Portuguese to English using OpenCode Zen API.
+Translate Excel file from Portuguese to English.
 
-OpenCode Zen is an OpenAI-compatible gateway (https://opencode.ai/zen/v1)
-that gives access to 30+ curated models (Claude, GPT, Gemini, Qwen…)
-with a single API key and pay-as-you-go billing.
+Supports two providers via --provider:
+
+  opencode-zen  (default) — OpenCode Zen gateway, OpenAI-compatible.
+                            Free model: opencode/big-pickle
+                            Key: OPENCODE_ZEN_API_KEY env var or --api-key
+
+  gemini                  — Google Gemini API.
+                            Tested model: gemini-2.5-flash
+                            Key: GEMINI_API_KEY env var or --api-key
 
 Usage:
-    python translate_excel.py input.xlsx output.xlsx --api-key YOUR_KEY
-    python translate_excel.py input.xlsx output.xlsx  # reads OPENCODE_ZEN_API_KEY env var
+    python translate_excel.py input.xlsx output.xlsx                          # opencode-zen default
+    python translate_excel.py input.xlsx output.xlsx --provider gemini --api-key AIza...
+    python translate_excel.py input.xlsx output.xlsx --list-models
 """
 
 import argparse
@@ -22,24 +29,24 @@ from datetime import datetime
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 
-try:
-    from openai import OpenAI
-except ImportError:
-    print("ERROR: openai not installed. Run: pip install openai")
-    sys.exit(1)
+# Provider constants
+PROVIDER_OPENCODE = "opencode-zen"
+PROVIDER_GEMINI   = "gemini"
 
-OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen/v1"
+OPENCODE_BASE_URL   = "https://opencode.ai/zen/v1"
+OPENCODE_DEFAULT    = "opencode/big-pickle"
+GEMINI_DEFAULT      = "gemini-2.5-flash"
 
 
 # ─── Progress logger ────────────────────────────────────────────────────────
 
 class Progress:
     def __init__(self, total_cells: int, total_batches: int):
-        self.total_cells = total_cells
+        self.total_cells   = total_cells
         self.total_batches = total_batches
-        self.cells_done = 0
-        self.batches_done = 0
-        self.start_time = time.time()
+        self.cells_done    = 0
+        self.batches_done  = 0
+        self.start_time    = time.time()
 
     def _elapsed(self) -> str:
         s = int(time.time() - self.start_time)
@@ -54,7 +61,7 @@ class Progress:
         eta_s = int(remaining / rate) if rate > 0 else 0
         return f"{eta_s // 60:02d}:{eta_s % 60:02d}"
 
-    def start_batch(self, batch_num: int, batch_size: int, sheet: str):
+    def start_batch(self, batch_num: int, sheet: str):
         pct = self.cells_done / self.total_cells * 100 if self.total_cells else 0
         bar_len = 25
         filled = int(bar_len * pct / 100)
@@ -84,7 +91,7 @@ class Progress:
         )
 
 
-# ─── Translation helpers ────────────────────────────────────────────────────
+# ─── Shared helpers ──────────────────────────────────────────────────────────
 
 def should_translate(cell) -> bool:
     if isinstance(cell, MergedCell):
@@ -100,10 +107,9 @@ def should_translate(cell) -> bool:
     return True
 
 
-def translate_batch(client: OpenAI, model_name: str, texts: list) -> list:
+def _build_prompt(texts: list) -> str:
     texts_json = json.dumps(texts, ensure_ascii=False, indent=2)
-
-    prompt = f"""You are a professional translator. Translate the following texts from Portuguese to English.
+    return f"""You are a professional translator. Translate the following texts from Portuguese to English.
 
 STRICT RULES:
 1. Proper nouns (person names, place names) → keep unchanged.
@@ -127,6 +133,53 @@ Input ({len(texts)} texts):
 
 Output (JSON array, {len(texts)} strings):"""
 
+
+def _parse_response(raw: str, expected: int, texts: list) -> list:
+    """Parse a JSON array from model output. Falls back to originals on failure."""
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(lines[1:-1]).strip()
+    try:
+        result = json.loads(raw)
+        if not isinstance(result, list) or len(result) != expected:
+            raise ValueError(f"Got {len(result) if isinstance(result, list) else '?'}, expected {expected}")
+        return [str(t) for t in result]
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"\n  WARNING: could not parse response ({exc}) — keeping originals for this batch.")
+        return texts
+
+
+def _handle_error(exc: Exception, attempt: int, max_retries: int) -> float | None:
+    """
+    Decide what to do with an exception.
+    Returns a sleep duration if we should retry, None if we should use originals,
+    or raises SystemExit for fatal errors.
+    """
+    err_str = str(exc)
+
+    if "429" in err_str or "rate" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
+        if attempt < max_retries - 1:
+            delay = 62.0
+            match = re.search(r"retry[^\d]*(\d+(?:\.\d+)?)\s*s", err_str, re.I)
+            if match:
+                delay = float(match.group(1)) + 3
+            print(f"\n  [rate limit] waiting {delay:.0f}s (attempt {attempt + 1}/{max_retries})…", flush=True)
+            return delay
+        print(f"\n  WARNING: rate limit persisted after {max_retries} retries — keeping originals.")
+        return None
+
+    if any(code in err_str for code in ("401", "403", "404", "NOT_FOUND", "PERMISSION_DENIED", "Unauthorized")):
+        print(f"\n\nFATAL: {exc}\n")
+        sys.exit(1)
+
+    print(f"\n  WARNING: unexpected error ({exc}) — keeping originals for this batch.")
+    return None
+
+
+# ─── OpenCode Zen backend ────────────────────────────────────────────────────
+
+def _opencode_batch(client, model_name: str, texts: list) -> list:
+    prompt = _build_prompt(texts)
     max_retries = 6
     for attempt in range(max_retries):
         try:
@@ -134,47 +187,55 @@ Output (JSON array, {len(texts)} strings):"""
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = response.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                lines = raw.splitlines()
-                raw = "\n".join(lines[1:-1]).strip()
-
-            translations = json.loads(raw)
-            if not isinstance(translations, list) or len(translations) != len(texts):
-                raise ValueError(f"Got {len(translations) if isinstance(translations, list) else '?'} items, expected {len(texts)}")
-            return [str(t) for t in translations]
-
+            raw = (response.choices[0].message.content or "").strip()
+            return _parse_response(raw, len(texts), texts)
         except Exception as exc:
-            err_str = str(exc)
-
-            # Rate limit — honour the suggested retry delay
-            if "429" in err_str or "rate" in err_str.lower():
-                delay = 62.0
-                match = re.search(r"retry[^\d]*(\d+(?:\.\d+)?)\s*s", err_str, re.I)
-                if match:
-                    delay = float(match.group(1)) + 3
-                if attempt < max_retries - 1:
-                    print(f"\n  [rate limit] waiting {delay:.0f}s (attempt {attempt + 1}/{max_retries})…", flush=True)
-                    time.sleep(delay)
-                    continue
-                else:
-                    print(f"\n  WARNING: rate limit persisted after {max_retries} retries — keeping originals for this batch.")
-                    return texts
-
-            # Fatal errors (auth / model not found) — abort immediately
-            if any(code in err_str for code in ("401", "403", "404", "NOT_FOUND", "PERMISSION_DENIED", "Unauthorized")):
-                print(f"\n\nFATAL: {exc}\n")
-                sys.exit(1)
-
-            print(f"\n  WARNING: unexpected error ({exc}) — keeping originals for this batch.")
-            return texts
-
+            delay = _handle_error(exc, attempt, max_retries)
+            if delay is None:
+                return texts
+            time.sleep(delay)
     return texts
+
+
+def build_opencode_client(api_key: str):
+    try:
+        from openai import OpenAI
+    except ImportError:
+        print("ERROR: openai not installed. Run: pip install openai")
+        sys.exit(1)
+    return OpenAI(api_key=api_key, base_url=OPENCODE_BASE_URL)
+
+
+# ─── Google Gemini backend ───────────────────────────────────────────────────
+
+def _gemini_batch(client, model_name: str, texts: list) -> list:
+    prompt = _build_prompt(texts)
+    max_retries = 6
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(model=model_name, contents=prompt)
+            raw = response.text.strip()
+            return _parse_response(raw, len(texts), texts)
+        except Exception as exc:
+            delay = _handle_error(exc, attempt, max_retries)
+            if delay is None:
+                return texts
+            time.sleep(delay)
+    return texts
+
+
+def build_gemini_client(api_key: str):
+    try:
+        from google import genai
+    except ImportError:
+        print("ERROR: google-genai not installed. Run: pip install google-genai")
+        sys.exit(1)
+    return genai.Client(api_key=api_key)
 
 
 # ─── Core workbook translation ───────────────────────────────────────────────
 
-def translate_workbook(wb: openpyxl.Workbook, client: OpenAI, model_name: str, batch_size: int) -> None:
+def translate_workbook(wb: openpyxl.Workbook, translate_fn, model_name: str, batch_size: int) -> None:
     pending = []
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -203,8 +264,8 @@ def translate_workbook(wb: openpyxl.Workbook, client: OpenAI, model_name: str, b
         batch_num = i // batch_size + 1
         sheet_name = pending[i][0]
 
-        progress.start_batch(batch_num, len(batch), sheet_name)
-        result = translate_batch(client, model_name, batch)
+        progress.start_batch(batch_num, sheet_name)
+        result = translate_fn(batch)
         translated.extend(result)
         progress.finish_batch(len(batch))
 
@@ -227,20 +288,33 @@ def translate_workbook(wb: openpyxl.Workbook, client: OpenAI, model_name: str, b
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Translate an Excel (.xlsx) file from Portuguese to English via OpenCode Zen."
+        description="Translate an Excel (.xlsx) file from Portuguese to English."
     )
-    parser.add_argument("input", help="Path to the source .xlsx file")
-    parser.add_argument("output", help="Path for the translated .xlsx file (date and model are appended automatically)")
+    parser.add_argument("input",  help="Path to the source .xlsx file")
+    parser.add_argument("output", help="Path for the translated .xlsx file (date and model appended automatically)")
+    parser.add_argument(
+        "--provider",
+        choices=[PROVIDER_OPENCODE, PROVIDER_GEMINI],
+        default=PROVIDER_OPENCODE,
+        help=f"Translation provider (default: {PROVIDER_OPENCODE})",
+    )
     parser.add_argument(
         "--api-key",
         default=None,
-        help="OpenCode Zen API key (falls back to OPENCODE_ZEN_API_KEY env var). Get one at https://opencode.ai",
+        help=(
+            f"API key for the selected provider. "
+            f"Falls back to OPENCODE_ZEN_API_KEY ({PROVIDER_OPENCODE}) "
+            f"or GEMINI_API_KEY ({PROVIDER_GEMINI}) env vars."
+        ),
     )
     parser.add_argument(
         "--model",
-        default="opencode/claude-sonnet-4-5",
-        help="Model name in OpenCode Zen format (default: opencode/claude-sonnet-4-5). "
-             "Run with --list-models to see all available options.",
+        default=None,
+        help=(
+            f"Model name override. Defaults: "
+            f"{PROVIDER_OPENCODE}={OPENCODE_DEFAULT!r}, "
+            f"{PROVIDER_GEMINI}={GEMINI_DEFAULT!r}"
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -251,36 +325,61 @@ def main():
     parser.add_argument(
         "--list-models",
         action="store_true",
-        help="List available models for your API key and exit",
+        help="List available models for the selected provider and exit",
     )
     args = parser.parse_args()
 
-    api_key = args.api_key or os.environ.get("OPENCODE_ZEN_API_KEY")
+    # Resolve API key and model defaults per provider
+    if args.provider == PROVIDER_OPENCODE:
+        api_key = args.api_key or os.environ.get("OPENCODE_ZEN_API_KEY")
+        model   = args.model or OPENCODE_DEFAULT
+        env_var = "OPENCODE_ZEN_API_KEY"
+        client  = None  # built after key check
+    else:
+        api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
+        model   = args.model or GEMINI_DEFAULT
+        env_var = "GEMINI_API_KEY"
+        client  = None
+
     if not api_key:
         print(
-            "ERROR: OpenCode Zen API key not found.\n"
-            "  Pass --api-key YOUR_KEY  or  set the OPENCODE_ZEN_API_KEY environment variable.\n"
-            "  Get a free key at: https://opencode.ai"
+            f"ERROR: API key not found for provider '{args.provider}'.\n"
+            f"  Pass --api-key YOUR_KEY  or  set the {env_var} environment variable."
         )
         sys.exit(1)
 
-    client = OpenAI(api_key=api_key, base_url=OPENCODE_ZEN_BASE_URL)
+    # Build client
+    if args.provider == PROVIDER_OPENCODE:
+        client = build_opencode_client(api_key)
+        translate_fn = lambda texts: _opencode_batch(client, model, texts)
 
-    if args.list_models:
-        print("Available models in OpenCode Zen:\n")
-        for m in client.models.list():
-            print(f"  {m.id}")
-        return
+        if args.list_models:
+            print(f"Available models ({PROVIDER_OPENCODE}):\n")
+            for m in client.models.list():
+                print(f"  {m.id}")
+            return
 
-    base, ext = os.path.splitext(args.output)
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    model_slug = args.model.replace("/", "-")
-    output_path = f"{base}_{date_str}_{model_slug}{ext}"
+    else:
+        client = build_gemini_client(api_key)
+        translate_fn = lambda texts: _gemini_batch(client, model, texts)
 
-    print(f"Loading: {args.input}")
+        if args.list_models:
+            print(f"Available models ({PROVIDER_GEMINI}):\n")
+            for m in client.models.list():
+                if "generateContent" in (m.supported_actions or []):
+                    print(f"  {m.name}")
+            return
+
+    print(f"Provider : {args.provider}")
+    print(f"Loading  : {args.input}")
     wb = openpyxl.load_workbook(args.input)
 
-    translate_workbook(wb, client, args.model, args.batch_size)
+    translate_workbook(wb, translate_fn, model, args.batch_size)
+
+    base, ext = os.path.splitext(args.output)
+    date_str   = datetime.now().strftime("%Y-%m-%d")
+    model_slug = model.replace("/", "-")
+    output_path = f"{base}_{date_str}_{model_slug}{ext}"
 
     print(f"Saving: {output_path}")
     wb.save(output_path)
