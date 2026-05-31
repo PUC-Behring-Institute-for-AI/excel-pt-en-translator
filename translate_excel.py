@@ -103,6 +103,24 @@ def _sanitize(value: str) -> str:
     return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", value)
 
 
+def _sanitize_sheet_name(name: str) -> str:
+    """Sanitize a sheet tab name for Excel compatibility.
+
+    - Strip XML-illegal characters (via _sanitize)
+    - Strip Excel-illegal characters: \\ / ? * [ ] :
+    - Strip leading/trailing single quotes (reserved by Excel)
+    - Truncate to 31 characters (Excel limit)
+    - Fallback to "Sheet" if result is empty
+    """
+    name = _sanitize(name)
+    name = re.sub(r"[\\/?*\[\]:]", "", name)
+    name = name.strip("'")
+    name = name[:31]
+    if not name.strip():
+        name = "Sheet"
+    return name
+
+
 def should_translate(cell) -> bool:
     if isinstance(cell, MergedCell):
         return False
@@ -299,17 +317,37 @@ def translate_workbook(wb: openpyxl.Workbook, translate_fn, model_name: str, bat
                 continue
             start_col = column_index_from_string(m.group(1))
             start_row = int(m.group(2))
+            seen_names = set()
             for i, tcol in enumerate(tbl.tableColumns):
                 header_cell = ws.cell(row=start_row, column=start_col + i)
                 if header_cell.value and isinstance(header_cell.value, str):
-                    tcol.name = header_cell.value
+                    name = _sanitize(str(header_cell.value))
+                    if not name:
+                        continue
+                    original = name
+                    suffix = 2
+                    while name in seen_names:
+                        name = f"{original}_{suffix}"
+                        suffix += 1
+                    seen_names.add(name)
+                    tcol.name = name
 
     # Translate sheet tab names
     print("  Translating sheet names…", end=" ", flush=True)
     old_names = wb.sheetnames
     translated_names = translate_fn(old_names)
+    used_names = set()
     for old, new in zip(old_names, translated_names):
-        wb[old].title = _sanitize(new)
+        new = _sanitize_sheet_name(new)
+        original = new
+        suffix = 2
+        while new in used_names:
+            suffix_str = f" ({suffix})"
+            max_base = 31 - len(suffix_str)
+            new = f"{original[:max_base]}{suffix_str}"
+            suffix += 1
+        used_names.add(new)
+        wb[old].title = new
     print("done")
 
     print(f"\n{'─' * 60}")
@@ -416,6 +454,7 @@ def main():
 
     print(f"Saving: {output_path}")
     wb.save(output_path)
+    wb.close()
     print("Done!")
 
 
