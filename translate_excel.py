@@ -34,7 +34,7 @@ PROVIDER_OPENCODE = "opencode-zen"
 PROVIDER_GEMINI   = "gemini"
 
 OPENCODE_BASE_URL   = "https://opencode.ai/zen/v1"
-OPENCODE_DEFAULT    = "opencode/big-pickle"
+OPENCODE_DEFAULT    = "deepseek-v4-flash-free"
 GEMINI_DEFAULT      = "gemini-2.5-flash"
 
 
