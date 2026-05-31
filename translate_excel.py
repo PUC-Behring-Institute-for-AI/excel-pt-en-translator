@@ -93,6 +93,15 @@ class Progress:
 
 # ─── Shared helpers ──────────────────────────────────────────────────────────
 
+def _sanitize(value: str) -> str:
+    """Remove characters that are illegal in XML 1.0 and would corrupt the .xlsx file.
+
+    Legal: tab (0x09), newline (0x0A), carriage return (0x0D), 0x20+
+    Illegal: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F
+    """
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", value)
+
+
 def should_translate(cell) -> bool:
     if isinstance(cell, MergedCell):
         return False
@@ -277,7 +286,7 @@ def translate_workbook(wb: openpyxl.Workbook, translate_fn, model_name: str, bat
     for (sheet_name, row, col, _), new_value in zip(pending, translated):
         cell = wb[sheet_name].cell(row=row, column=col)
         if not isinstance(cell, MergedCell):
-            cell.value = new_value
+            cell.value = _sanitize(new_value)
 
     print(f"\n{'─' * 60}")
     print(f"  Finished     : {datetime.now().strftime('%H:%M:%S')}")
