@@ -28,6 +28,7 @@ from datetime import datetime
 
 import openpyxl
 from openpyxl.cell.cell import MergedCell
+from openpyxl.utils import column_index_from_string
 
 # Provider constants
 PROVIDER_OPENCODE = "opencode-zen"
@@ -35,7 +36,7 @@ PROVIDER_GEMINI   = "gemini"
 
 OPENCODE_BASE_URL   = "https://opencode.ai/zen/v1"
 OPENCODE_DEFAULT    = "deepseek-v4-flash-free"
-GEMINI_DEFAULT      = "gemini-2.5-flash"
+GEMINI_DEFAULT      = "gemini-3.1-flash-lite"
 
 
 # ─── Progress logger ────────────────────────────────────────────────────────
@@ -287,6 +288,21 @@ def translate_workbook(wb: openpyxl.Workbook, translate_fn, model_name: str, bat
         cell = wb[sheet_name].cell(row=row, column=col)
         if not isinstance(cell, MergedCell):
             cell.value = _sanitize(new_value)
+
+    # Sync Excel table column names with translated header cells.
+    # openpyxl updates cell values but not the table metadata — Excel
+    # validates they match and reports corruption when they diverge.
+    for ws in wb.worksheets:
+        for tbl in ws.tables.values():
+            m = re.match(r'([A-Z]+)(\d+)', tbl.ref.split(':')[0])
+            if not m:
+                continue
+            start_col = column_index_from_string(m.group(1))
+            start_row = int(m.group(2))
+            for i, tcol in enumerate(tbl.tableColumns):
+                header_cell = ws.cell(row=start_row, column=start_col + i)
+                if header_cell.value and isinstance(header_cell.value, str):
+                    tcol.name = header_cell.value
 
     # Translate sheet tab names
     print("  Translating sheet names…", end=" ", flush=True)
